@@ -12,11 +12,15 @@ class FourPhaseCommitService
 
     public function __construct()
     {
-        // Dùng array_values để ép PHP đánh lại số thứ tự mảng chuẩn 100%
-        $this->nodes = array_values(array_filter([
-            env('NODE_1_URL'), env('NODE_2_URL'), env('NODE_3_URL'),
-            env('NODE_4_URL'), env('NODE_5_URL')
-        ]));
+        // 1. DÁN CỨNG (HARDCODE) 5 LINK RENDER
+        // Vượt qua 100% lỗi bộ nhớ đệm (Cache) của biến env() trên Docker
+        $this->nodes = [
+            'https://node-1-khanh.onrender.com',
+            'https://node-2-khai.onrender.com',
+            'https://node-3-khaiii.onrender.com',
+            'https://node-4-kien.onrender.com',
+            'https://node-5-duy.onrender.com'
+        ];
     }
 
     public function executeTransaction(array $bookingData): bool
@@ -36,7 +40,7 @@ class FourPhaseCommitService
                 return false;
             }
 
-            // Tạm dừng để Demo
+            // Tạm dừng để Demo 4 Pha
             sleep(10); 
 
             if (!$this->phase3DoCommit($transactionId)) {
@@ -49,17 +53,19 @@ class FourPhaseCommitService
         } catch (\Exception $e) {
             $errorMsg = $e->getMessage();
             
-            // Nếu bắt đúng mã lỗi NODE_DEAD từ hàm sendParallelRequests
+            // 2. BẮT LỖI NODE_DEAD PHIÊN BẢN CLOUD (Đọc tên miền thay vì Đọc cổng)
             if (strpos($errorMsg, 'NODE_DEAD|') !== false) {
-                // Tách lấy cái Cổng bị chết (VD: 8003)
-                $port = explode('|', $errorMsg)[1];
-                $reason = "HỦY DO NODE $port CHẾT"; 
+                $parts = explode('|', $errorMsg);
+                $host = $parts[1] ?? 'Unknown_Node';
+                $detail = $parts[2] ?? 'Không rõ lý do';
+                
+                $reason = "HỦY DO NODE [$host] TỪ CHỐI"; 
                 
                 // Bắn lệnh Hủy kèm theo Lý do sang cho các Node đang sống
                 $this->abortTransaction($transactionId, $reason, $roomId, $customerName);
                 
-                // Đá văng trang chủ với thông báo lỗi chuẩn xác
-               throw new \Exception("Chi tiết lỗi mạng: " . $e->getMessage());
+                // Đá văng trang chủ với thông báo lỗi chuẩn xác: Ai chết và Vì sao chết
+                throw new \Exception("Chi tiết lỗi mạng: $host | Nguyên nhân: $detail");
             } 
             else {
                 // Nếu bị lỗi thật sự do cướp phòng
@@ -71,17 +77,17 @@ class FourPhaseCommitService
 
     private function phase1CanCommit($data): bool
     {
-        return $this->sendParallelRequests('/can-commit', ['id' => $data['id'], 'room_id' => $data['room_id']], 'YES');
+        return $this->sendParallelRequests('/api/can-commit', ['id' => $data['id'], 'room_id' => $data['room_id']], 'YES');
     }
 
     private function phase2PreCommit($transactionId, $roomId = null, $customerName = null): bool
     {
-        return $this->sendParallelRequests('/pre-commit', ['transaction_id' => $transactionId, 'room_id' => $roomId, 'customer_name' => $customerName], 'ACK');
+        return $this->sendParallelRequests('/api/pre-commit', ['transaction_id' => $transactionId, 'room_id' => $roomId, 'customer_name' => $customerName], 'ACK');
     }
 
     private function phase3DoCommit($transactionId): bool
     {
-        return $this->sendParallelRequests('/do-commit', ['transaction_id' => $transactionId], 'SUCCESS');
+        return $this->sendParallelRequests('/api/do-commit', ['transaction_id' => $transactionId], 'SUCCESS');
     }
 
     public function abortTransaction($transactionId, $reason = "ABORTED", $roomId = null, $customerName = null)
@@ -90,7 +96,8 @@ class FourPhaseCommitService
         
         foreach ($this->nodes as $nodeUrl) {
             try {
-                Http::timeout(3)->post($nodeUrl . '/abort', [
+                // Thêm withoutVerifying() để ép vượt rào bảo mật SSL trên Cloud
+                Http::withoutVerifying()->timeout(3)->post($nodeUrl . '/api/abort', [
                     'transaction_id' => $transactionId,
                     'reason' => $reason,
                     'room_id' => $roomId,
@@ -106,28 +113,30 @@ class FourPhaseCommitService
     {
         if (empty($this->nodes)) return true; 
 
-        // Gửi lệnh song song, dùng chính URL làm Chìa khóa (Alias) để không bao giờ bị lệch mảng
+        // Gửi lệnh song song, dùng chính URL làm Alias
         $responses = Http::pool(function (Pool $pool) use ($endpoint, $payload) {
             foreach ($this->nodes as $nodeUrl) {
-                $pool->as($nodeUrl)->timeout(5)->post($nodeUrl . $endpoint, $payload);
+                // 3. VŨ KHÍ TỐI THƯỢNG: withoutVerifying() để không bị Cloud chặn SSL
+                $pool->as($nodeUrl)->withoutVerifying()->timeout(15)->post($nodeUrl . $endpoint, $payload);
             }
         });
 
         // Duyệt kết quả dựa trên cái URL vừa gửi
         foreach ($responses as $nodeUrl => $response) {
-            // Cắt cái URL ra để lấy đúng số Cổng (VD: 8003)
+            
             $parsedUrl = parse_url($nodeUrl);
-            $nodePort = $parsedUrl['port'] ?? 'Unknown';
+            $nodeHost = $parsedUrl['host'] ?? 'Unknown_Host';
 
-            // KẾT ÁN: Nếu mất kết nối, ném thẳng mã lỗi chứa số cổng lên trên
+            // KẾT ÁN: Nếu mất kết nối, ném mã lỗi kèm theo Tên miền và Mã lỗi thực tế
             if ($response instanceof \Exception || !$response->ok()) {
-                throw new \Exception("NODE_DEAD|$nodePort");
+                $errorDetail = $response instanceof \Exception ? $response->getMessage() : "HTTP Status " . $response->status();
+                throw new \Exception("NODE_DEAD|$nodeHost|$errorDetail");
             }
             
             $status = $response->json('status');
             
             // Xử lý báo lỗi cướp phòng
-            if ($endpoint === '/can-commit' && $status === 'NO') {
+            if (strpos($endpoint, 'can-commit') !== false && $status === 'NO') {
                 throw new \Exception("Rất tiếc! Phòng số {$payload['room_id']} vừa bị khách khác khóa trước...");
             }
 
