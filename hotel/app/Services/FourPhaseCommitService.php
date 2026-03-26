@@ -121,24 +121,42 @@ class FourPhaseCommitService
         }
     }
 
-    private function sendParallelRequests($endpoint, $payload, $expectedStatus): bool
+   private function sendParallelRequests($endpoint, $payload, $expectedStatus): bool
     {
         if (empty($this->nodes)) return true; 
 
         $responses = Http::pool(function (Pool $pool) use ($endpoint, $payload) {
             foreach ($this->nodes as $nodeUrl) {
-                // withoutVerifying() để vượt rào chứng chỉ HTTPS trên Render
-                $pool->as($nodeUrl)->withoutVerifying()->timeout(15)->post($nodeUrl . $endpoint, $payload);
+                // VŨ KHÍ 1: Thêm connectTimeout(3) -> Gõ cửa 3 giây không thưa là xác định tắt máy!
+                // Giữ nguyên timeout(15) -> Giới hạn xử lý 15 giây để không làm treo trang web.
+                $pool->as($nodeUrl)->withoutVerifying()->connectTimeout(6)->timeout(15)->post($nodeUrl . $endpoint, $payload);
             }
         });
+
+        // VŨ KHÍ 2: Bảng phân loại ưu tiên lỗi
+        $deadNodeError = null;    // Lỗi chết hẳn (Máy tắt, từ chối kết nối) - Ưu tiên 1
+        $timeoutNodeError = null; // Lỗi do mạng chậm (Timeout) - Ưu tiên 2
 
         foreach ($responses as $nodeUrl => $response) {
             $parsedUrl = parse_url($nodeUrl);
             $nodeHost = $parsedUrl['host'] ?? 'Unknown_Host';
 
-            if ($response instanceof \Exception || !$response->ok()) {
-                $errorDetail = $response instanceof \Exception ? $response->getMessage() : "HTTP Status " . $response->status();
-                throw new \Exception("NODE_DEAD|$nodeHost|$errorDetail");
+            if ($response instanceof \Exception) {
+                $errorMsg = $response->getMessage();
+                
+                // Phân loại lỗi
+                if (strpos($errorMsg, 'timed out') !== false || strpos($errorMsg, 'cURL error 28') !== false) {
+                    $timeoutNodeError = "NODE_DEAD|$nodeHost|Quá tải (Timeout)";
+                } else {
+                    // Lỗi từ chối kết nối, sập nguồn (cURL error 7, error 6...)
+                    $deadNodeError = "NODE_DEAD|$nodeHost|Server đang tắt hoặc sập nguồn";
+                }
+                continue; // Ghi nhận lỗi nhưng duyệt tiếp mảng để tìm trùm cuối!
+            }
+            
+            if (!$response->ok()) {
+                $deadNodeError = "NODE_DEAD|$nodeHost|Lỗi HTTP " . $response->status();
+                continue;
             }
             
             $status = $response->json('status');
@@ -151,6 +169,15 @@ class FourPhaseCommitService
                 return false; 
             }
         }
+
+        // TÒA TUYÊN ÁN (Xử lý theo thứ tự ưu tiên)
+        if ($deadNodeError) {
+            throw new \Exception($deadNodeError); // Có thằng tắt máy -> Chửi thằng tắt máy trước!
+        }
+        if ($timeoutNodeError) {
+            throw new \Exception($timeoutNodeError); // Không ai tắt máy, chỉ có thằng chậm -> Chửi thằng chậm.
+        }
+
         return true;
     }
 }
