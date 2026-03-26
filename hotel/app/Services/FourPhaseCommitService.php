@@ -12,22 +12,31 @@ class FourPhaseCommitService
 
     public function __construct()
     {
-        // 1. DÁN CỨNG (HARDCODE) 5 LINK RENDER
-        // Vượt qua 100% lỗi bộ nhớ đệm (Cache) của biến env() trên Docker
-        $this->nodes = [
+        // Danh sách 5 Node vệ tinh
+        $nodes = [
             'https://node-1-khanh.onrender.com',
             'https://node-2-khai.onrender.com',
-            'https://node-3-khaiii.onrender.com',
+            'https://node-3-khaiii.onrender.com', // Điền đúng link Node 3 của bạn vào
             'https://node-4-kien.onrender.com',
             'https://node-5-duy.onrender.com'
         ];
+        
+        // Lọc bỏ các khoảng trắng hoặc link bị rỗng
+        $this->nodes = array_values(array_filter($nodes));
     }
 
     public function executeTransaction(array $bookingData): bool
     {
+        // 1. CHỐT CHẶN BẢO MẬT: Bắt buộc 5 Node
+        if (count($this->nodes) !== 5) {
+            throw new \Exception("Lỗi 4PC Nghiêm trọng: Yêu cầu chính xác 5 Server. Hiện tại chỉ phát hiện " . count($this->nodes) . " Server hoạt động!");
+        }
+
         $transactionId = $bookingData['id'];
         $roomId = $bookingData['room_id'] ?? null;
         $customerName = $bookingData['name'] ?? null;
+        
+        $pointOfNoReturn = false; // Biến đánh dấu điểm chết của 4PC
 
         try {
             if (!$this->phase1CanCommit($bookingData)) {
@@ -40,35 +49,39 @@ class FourPhaseCommitService
                 return false;
             }
 
-            // Tạm dừng để Demo 4 Pha
-            sleep(10); 
+            // --- BƯỚC QUA ĐIỂM KHÔNG THỂ QUAY ĐẦU (POINT OF NO RETURN) ---
+            // Từ giây phút này, 100% các Node đã hứa sẽ Commit. 
+            // Nếu Đầu não hoặc Node chết ở Pha 3, Giao dịch BẮT BUỘC vẫn phải thành công!
+            $pointOfNoReturn = true;
 
-            if (!$this->phase3DoCommit($transactionId)) {
-                $this->abortTransaction($transactionId, "LỖI CHỐT HẠ", $roomId, $customerName);
-                return false;
-            }
+            sleep(10); // Giữ nguyên sleep để Demo
+
+            // Bắn Pha 3 (Do-Commit)
+            $this->phase3DoCommit($transactionId);
 
             return true; 
 
         } catch (\Exception $e) {
             $errorMsg = $e->getMessage();
             
-            // 2. BẮT LỖI NODE_DEAD PHIÊN BẢN CLOUD (Đọc tên miền thay vì Đọc cổng)
+            // 2. XỬ LÝ LỖI Ở ĐIỂM MÙ PHA 3
+            if ($pointOfNoReturn) {
+                // ĐÃ CHỐT HẠ THÌ CẤM ABORT!
+                // Ghi log Node chết để cơ chế phục hồi xử lý sau, trên Web vẫn báo thành công.
+                Log::warning("Giao dịch $transactionId thành công. Nhưng có Node bị đứt kết nối lúc Do-Commit: " . $errorMsg);
+                return true; 
+            }
+
+            // 3. XỬ LÝ LỖI Ở PHA 1 HOẶC PHA 2 (CHƯA CHỐT HẠ) -> ABORT BÌNH THƯỜNG
             if (strpos($errorMsg, 'NODE_DEAD|') !== false) {
                 $parts = explode('|', $errorMsg);
                 $host = $parts[1] ?? 'Unknown_Node';
-                $detail = $parts[2] ?? 'Không rõ lý do';
+                $reason = "HỦY DO NODE [$host] TỪ CHỐI/CHẾT"; 
                 
-                $reason = "HỦY DO NODE [$host] TỪ CHỐI"; 
-                
-                // Bắn lệnh Hủy kèm theo Lý do sang cho các Node đang sống
                 $this->abortTransaction($transactionId, $reason, $roomId, $customerName);
-                
-                // Đá văng trang chủ với thông báo lỗi chuẩn xác: Ai chết và Vì sao chết
-                throw new \Exception("Chi tiết lỗi mạng: $host | Nguyên nhân: $detail");
+                throw new \Exception("Chi tiết lỗi mạng: Node $host không phản hồi | Nguyên nhân: " . ($parts[2] ?? 'Timeout'));
             } 
             else {
-                // Nếu bị lỗi thật sự do cướp phòng
                 $this->abortTransaction($transactionId, "ABORTED (BỊ CƯỚP PHÒNG)", $roomId, $customerName);
                 throw $e; 
             }
@@ -96,7 +109,6 @@ class FourPhaseCommitService
         
         foreach ($this->nodes as $nodeUrl) {
             try {
-                // Thêm withoutVerifying() để ép vượt rào bảo mật SSL trên Cloud
                 Http::withoutVerifying()->timeout(3)->post($nodeUrl . '/api/abort', [
                     'transaction_id' => $transactionId,
                     'reason' => $reason,
@@ -104,7 +116,7 @@ class FourPhaseCommitService
                     'customer_name' => $customerName
                 ]);
             } catch (\Exception $e) {
-                // Thằng nào chết thì kệ nó, lặp tiếp để cứu các thằng đang sống
+                // Thằng nào chết thì kệ nó
             }
         }
     }
@@ -113,21 +125,17 @@ class FourPhaseCommitService
     {
         if (empty($this->nodes)) return true; 
 
-        // Gửi lệnh song song, dùng chính URL làm Alias
         $responses = Http::pool(function (Pool $pool) use ($endpoint, $payload) {
             foreach ($this->nodes as $nodeUrl) {
-                // 3. VŨ KHÍ TỐI THƯỢNG: withoutVerifying() để không bị Cloud chặn SSL
+                // withoutVerifying() để vượt rào chứng chỉ HTTPS trên Render
                 $pool->as($nodeUrl)->withoutVerifying()->timeout(15)->post($nodeUrl . $endpoint, $payload);
             }
         });
 
-        // Duyệt kết quả dựa trên cái URL vừa gửi
         foreach ($responses as $nodeUrl => $response) {
-            
             $parsedUrl = parse_url($nodeUrl);
             $nodeHost = $parsedUrl['host'] ?? 'Unknown_Host';
 
-            // KẾT ÁN: Nếu mất kết nối, ném mã lỗi kèm theo Tên miền và Mã lỗi thực tế
             if ($response instanceof \Exception || !$response->ok()) {
                 $errorDetail = $response instanceof \Exception ? $response->getMessage() : "HTTP Status " . $response->status();
                 throw new \Exception("NODE_DEAD|$nodeHost|$errorDetail");
@@ -135,7 +143,6 @@ class FourPhaseCommitService
             
             $status = $response->json('status');
             
-            // Xử lý báo lỗi cướp phòng
             if (strpos($endpoint, 'can-commit') !== false && $status === 'NO') {
                 throw new \Exception("Rất tiếc! Phòng số {$payload['room_id']} vừa bị khách khác khóa trước...");
             }
