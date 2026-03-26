@@ -59,7 +59,7 @@ class FourPhaseCommitService
                 $this->abortTransaction($transactionId, $reason, $roomId, $customerName);
                 
                 // Đá văng trang chủ với thông báo lỗi chuẩn xác
-               throw new \Exception("Lỗi kết nối Node: " . $url . " | Nguyên nhân thật: " . $e->getMessage());
+               throw new \Exception("Chi tiết lỗi mạng: " . $e->getMessage());
             } 
             else {
                 // Nếu bị lỗi thật sự do cướp phòng
