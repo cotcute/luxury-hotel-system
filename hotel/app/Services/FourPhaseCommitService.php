@@ -77,7 +77,7 @@ class FourPhaseCommitService
             } 
             elseif (strpos($errorMsg, 'CƯỚP PHÒNG|') !== false) {
                 $parts = explode('|', $errorMsg);
-                $this->abortTransaction($transactionId, "ABORTED (BỊ CƯỚP PHÒNG)", $roomId, $customerName);
+                $this->abortTransaction($transactionId, " 1 Trong 5 Serve bị tắt", $roomId, $customerName);
                 throw new \Exception($parts[2] ?? 'Phòng đã bị chiếm!'); 
             } 
             else {
@@ -133,7 +133,7 @@ class FourPhaseCommitService
 
                 // 2. Phòng bị khóa bởi ai đó
                 if (strpos($endpoint, 'can-commit') !== false && $status === 'NO') {
-                    throw new \Exception("CƯỚP PHÒNG|$host|Phòng số {$payload['room_id']} vừa bị khóa trước!");
+                    throw new \Exception("CƯỚP PHÒNG|$host|Phòng số {$payload['room_id']} đã hủy!");
                 }
 
                 // 3. Phản hồi sai cú pháp
