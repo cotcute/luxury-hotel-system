@@ -34,14 +34,15 @@ class FourPhaseCommitService
         $pointOfNoReturn = false; 
 
         try {
+            // LỖ HỔNG 2 ĐÃ ĐƯỢC VÁ: Ép văng Exception thay vì return false để Controller không thể bỏ qua!
             if (!$this->phase1CanCommit($bookingData)) {
                 $this->abortTransaction($transactionId, "TỪ CHỐI (PHA 1)", $roomId, $customerName);
-                return false;
+                throw new \Exception("Giao dịch bị từ chối ở Pha 1: Một số Server không đồng ý!");
             }
 
             if (!$this->phase2PreCommit($transactionId, $roomId, $customerName)) {
                 $this->abortTransaction($transactionId, "TỪ CHỐI (PHA 2)", $roomId, $customerName);
-                return false;
+                throw new \Exception("Giao dịch bị từ chối ở Pha 2: Lỗi Pre-Commit!");
             }
 
             $pointOfNoReturn = true;
@@ -58,22 +59,20 @@ class FourPhaseCommitService
                 return true; 
             }
 
-            // PHÂN LOẠI LỖI CHUẨN XÁC: CHẾT MẠNG vs CƯỚP PHÒNG
+            // PHÂN LOẠI LỖI CHUẨN XÁC
             if (strpos($errorMsg, 'NODE_DEAD|') !== false) {
                 $parts = explode('|', $errorMsg);
                 $host = $parts[1] ?? 'Unknown_Node';
                 $reason = "HỦY DO NODE [$host] TỪ CHỐI/CHẾT"; 
                 
                 $this->abortTransaction($transactionId, $reason, $roomId, $customerName);
-                throw new \Exception("Chi tiết lỗi mạng: Node $host không phản hồi | Nguyên nhân: " . ($parts[2] ?? 'Timeout'));
+                throw new \Exception("Chi tiết lỗi mạng: Node $host không phản hồi | Nguyên nhân: " . ($parts[2] ?? 'Mất kết nối'));
             } 
             elseif (strpos($errorMsg, 'CƯỚP PHÒNG') !== false) {
-                // CHỈ BÁO CƯỚP PHÒNG KHI ĐÚNG LÀ CƯỚP PHÒNG
                 $this->abortTransaction($transactionId, "ABORTED (BỊ CƯỚP PHÒNG)", $roomId, $customerName);
                 throw $e; 
             } 
             else {
-                // LỖI KHÁC BẤT NGỜ (Tránh vơ đũa cả nắm)
                 $this->abortTransaction($transactionId, "ABORTED (LỖI HỆ THỐNG)", $roomId, $customerName);
                 throw $e;
             }
@@ -116,15 +115,20 @@ class FourPhaseCommitService
 
         $responses = Http::pool(function (Pool $pool) use ($endpoint, $payload) {
             foreach ($this->nodes as $nodeUrl) {
-                $pool->as($nodeUrl)->withoutVerifying()->connectTimeout(3)->timeout(15)->post($nodeUrl . $endpoint, $payload);
+                // Thay withoutVerifying() bằng withOptions để tránh lỗi ngầm của Http::pool
+                $pool->as($nodeUrl)->withOptions(['verify' => false])->connectTimeout(3)->timeout(15)->post($nodeUrl . $endpoint, $payload);
             }
         });
 
+        // LỖ HỔNG 1 ĐÃ ĐƯỢC VÁ (VŨ KHÍ TỐI THƯỢNG): Đếm đủ 5 kết quả mới cho làm tiếp!
+        if (count($responses) < count($this->nodes)) {
+            throw new \Exception("NODE_DEAD|Hệ Thống|Có Server bị tắt nguồn, dữ liệu không trả về!");
+        }
+
         $deadNodeError = null;    
         $timeoutNodeError = null; 
-        $roomHijackedError = null; // Thêm biến lưu trạng thái Cướp phòng
+        $roomHijackedError = null; 
 
-        // BƯỚC 1: DUYỆT TÌM BẰNG HẾT LỖI CỦA 5 NODE (Không throw giữa chừng)
         foreach ($responses as $nodeUrl => $response) {
             $parsedUrl = parse_url($nodeUrl);
             $nodeHost = $parsedUrl['host'] ?? 'Unknown_Host';
@@ -146,7 +150,6 @@ class FourPhaseCommitService
             
             $status = $response->json('status');
             
-            // Nếu có Node báo NO, lưu vào biến chờ xét xử, không throw ngay!
             if (strpos($endpoint, 'can-commit') !== false && $status === 'NO') {
                 $roomHijackedError = "CƯỚP PHÒNG|Rất tiếc! Phòng số {$payload['room_id']} vừa bị khách khác khóa trước...";
                 continue; 
@@ -157,18 +160,14 @@ class FourPhaseCommitService
             }
         }
 
-        // BƯỚC 2: TÒA TUYÊN ÁN THEO ĐÚNG ĐỘ ƯU TIÊN (LOGIC VÀNG)
-        // Ưu tiên 1: Đứt mạng, chết nguồn (Nghiêm trọng nhất - Bác bỏ mọi trạng thái phòng)
+        // TÒA TUYÊN ÁN
         if ($deadNodeError) {
             throw new \Exception($deadNodeError); 
         }
-        // Ưu tiên 2: Mạng chậm (Cũng là đứt kết nối)
         if ($timeoutNodeError) {
             throw new \Exception($timeoutNodeError); 
         }
-        // Ưu tiên 3: Mạng khỏe 100%, NHƯNG phòng đã bị người khác khóa
         if ($roomHijackedError) {
-            // Tách chữ "CƯỚP PHÒNG|" ra để báo lên web
             throw new \Exception(explode('|', $roomHijackedError)[1]);
         }
 
